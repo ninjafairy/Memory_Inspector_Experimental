@@ -66,14 +66,15 @@ public final class HostModeEntry {
     }
 
     /** Per-verbose-command {@code cmd:} substring window (Q2). */
-    public static final int VERBOSE_ACK_TIMEOUT_MS = 500;
+    // 500ms works at 9600 baud but not at 1200 baud so we need to increase it.
+    public static final int VERBOSE_ACK_TIMEOUT_MS = 5000;
     /**
      * Post-{@code RESTART} RX drain window — user-specified 2000 ms per the
      * {@code hCmd.md §RESTART} "equivalent to power-cycle" contract. The
      * modem soft-reboots, emits a register dump / banner, and re-prints
      * {@code cmd:} within this window.
      */
-    public static final int RESTART_SETTLE_MS = 2000;
+    public static final int RESTART_SETTLE_MS = 5000;
     /** OGG probe response window (Q4). */
     public static final int PROBE_TIMEOUT_MS = 750;
     /** Short read block while polling — must divide cleanly into the match windows. */
@@ -158,8 +159,13 @@ public final class HostModeEntry {
             sendVerbose("AWL", TX_AWLEN);
             sendVerbose("PAR", TX_PARITY);
             sendVerbose("8BC", TX_8BITCONV);
+            sendVerbose("EXP", asciiCr("EXP ON"));
 
-            restart();
+            
+            char autobYn = readAutobYn();
+            log.logRaw("autobaud: " + autobYn);
+
+            restart(autobYn);
 
             writeAndLog("HYR", TX_HOST_Y_RESILIENT);
             sleepQuietly(POST_HOST_ON_SETTLE_MS);
@@ -199,8 +205,13 @@ public final class HostModeEntry {
      * <p>Critically: this is {@code RESTART}, NOT {@code RESET}. The latter
      * is destructive and forbidden per E2.
      */
-    private void restart() throws IOException, HostModeEntryException {
+    private void restart(char autobYn) throws IOException, HostModeEntryException {
         writeAndLog("RST", TX_RESTART);
+        sleepQuietly(1000); // Wait for the modem to restart
+        if (autobYn == 'Y') {
+            writeAndLog("ABS", new byte[]{ (byte)'*', 0x0D }); // Send * to trigger autobaud
+        }
+        sleepQuietly(1000); // Wait for the autobaud to complete
         StringBuilder sb = new StringBuilder(256);
         byte[] buf = new byte[256];
         long deadline = System.nanoTime() + msToNanos(RESTART_SETTLE_MS);
@@ -211,6 +222,9 @@ public final class HostModeEntry {
                     rx.feed(buf, 0, n);
                     for (int i = 0; i < n; i++) {
                         sb.append((char) (buf[i] & 0xFF));
+                    }
+                    if (sb.indexOf("cmd:") >= 0) {
+                        break;
                     }
                 }
             }
@@ -416,6 +430,18 @@ public final class HostModeEntry {
         } catch (InterruptedException ie) {
             Thread.currentThread().interrupt();
         }
+    }
+
+    private char readAutobYn() throws IOException {
+        writeAndLog("AUT", asciiCr("AUTOB"));
+        long deadline = System.nanoTime() + msToNanos(1000);
+        StringBuilder sb = new StringBuilder(64);
+        byte[] buf = new byte[256];
+        while (System.nanoTime() < deadline && sb.indexOf("AUTOBaud  ON") < 0 && sb.indexOf("AUTOBaud OFF") < 0) {
+            int n = link.read(buf, 0, buf.length);
+            if (n > 0) for (int i = 0; i < n; i++) sb.append((char) (buf[i] & 0xFF));
+        }
+        return sb.indexOf("AUTOBaud  ON") >= 0 ? 'Y' : 'N';
     }
 
     private static long msToNanos(int ms) {
