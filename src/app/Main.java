@@ -33,12 +33,16 @@ import javax.swing.JRadioButton;
 import javax.swing.JScrollBar;
 import javax.swing.JScrollPane;
 import javax.swing.JTextArea;
+import javax.swing.JTextField;
 import javax.swing.KeyStroke;
 import javax.swing.ScrollPaneConstants;
 import javax.swing.SwingConstants;
 import javax.swing.SwingUtilities;
 import javax.swing.UIManager;
 import javax.swing.WindowConstants;
+import javax.swing.text.AttributeSet;
+import javax.swing.text.BadLocationException;
+import javax.swing.text.PlainDocument;
 import java.awt.BorderLayout;
 import java.awt.Dimension;
 import java.awt.FlowLayout;
@@ -52,8 +56,10 @@ import java.io.FileWriter;
 import java.io.IOException;
 import java.io.PrintWriter;
 import java.lang.reflect.InvocationTargetException;
+import java.nio.charset.StandardCharsets;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
+import java.util.Objects;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
@@ -469,6 +475,67 @@ public final class Main {
         return b;
     }
 
+    /**
+     * One-line textual form of a received host {@link HostBlock}: CTL byte
+     * as hex, then spaced hex + printable-or-dot ASCII for the payload
+     * ({@link util.HexUtils} conventions for display).
+     */
+    private static String formatHostBlockResponseLine(HostBlock block) {
+        Objects.requireNonNull(block, "block");
+        byte[] payload = block.payloadCopy();
+        int ctl = block.ctl() & 0xFF;
+        StringBuilder sb = new StringBuilder(32 + payload.length * 4);
+        sb.append(String.format("%02X", ctl));
+        if (payload.length > 0) {
+            sb.append(' ').append(HexUtils.bytesToSpacedHex(payload, 0, payload.length))
+                    .append("  ").append(HexUtils.bytesToAsciiRender(payload, 0, payload.length));
+        }
+        return sb.toString();
+    }
+
+    /**
+     * Sends a PK-232 host global command: {@code SOH 0x4F} + 2-letter ASCII
+     * mnemonic + optional UTF-8 payload + {@code ETB}, using
+     * {@link HostCodec} framing via {@link PK232Client#sendAndAwait}, then
+     * appends the decoded response block to {@code output} on the EDT.
+     */
+    private static void sendHostCommand(PK232Client client,
+                                        String mnemonic,
+                                        String payload,
+                                        JTextArea output)
+            throws IOException, InterruptedException {
+        Objects.requireNonNull(client, "client");
+        Objects.requireNonNull(output, "output");
+        Objects.requireNonNull(mnemonic, "mnemonic");
+        if (mnemonic.length() != 2) {
+            throw new IllegalArgumentException("mnemonic must be exactly 2 characters");
+        }
+        for (int i = 0; i < 2; i++) {
+            char c = mnemonic.charAt(i);
+            if (c > 0x7F) {
+                throw new IllegalArgumentException("mnemonic must be ASCII");
+            }
+        }
+        String p = payload == null ? "" : payload;
+        byte[] blockPayload;
+        if (p.isEmpty()) {
+            blockPayload = new byte[] {
+                    (byte) mnemonic.charAt(0),
+                    (byte) mnemonic.charAt(1) };
+        } else {
+            byte[] utf8 = p.getBytes(StandardCharsets.UTF_8);
+            blockPayload = new byte[2 + utf8.length];
+            blockPayload[0] = (byte) mnemonic.charAt(0);
+            blockPayload[1] = (byte) mnemonic.charAt(1);
+            System.arraycopy(utf8, 0, blockPayload, 2, utf8.length);
+        }
+        HostBlock request = new HostBlock(HostBlock.CTL_GLOBAL_COMMAND, blockPayload);
+        HostBlock response = client.sendAndAwait(request, PK232Client.DEFAULT_TIMEOUT_MS);
+
+        final String rxLine = formatHostBlockResponseLine(response);
+        SwingUtilities.invokeLater(() -> output.append("> " + rxLine + "\n"));
+    }
+
     private static void showPlaceholderMainWindow(SerialLink link,
                                                   PacketLogger log,
                                                   ModemState state,
@@ -512,7 +579,27 @@ public final class Main {
         JLabel bpsLabel = new JLabel("— B/s",        SwingConstants.LEFT);
         JLabel etaLabel = new JLabel("ETA --:--",    SwingConstants.LEFT);
 
+        JTextField commandField = new JTextField(new PlainDocument() {
+            @Override
+            public void insertString(int offs, String str, AttributeSet a) throws BadLocationException {
+                if (str != null && getLength() + str.length() <= 2) {
+                    super.insertString(offs, str, a);
+                }
+            }
+        }, "", 2);
+
+        JTextField payloadField = new JTextField(20);
+
+        JLabel commandLabel = new JLabel("Command:", SwingConstants.LEFT);
+        JLabel payloadLabel = new JLabel("payload", SwingConstants.LEFT);
+        JButton  sendBtn     = new JButton("Send");
+
         JPanel southLeft = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 6));
+        southLeft.add(commandLabel);
+        southLeft.add(commandField);
+        southLeft.add(payloadLabel);
+        southLeft.add(payloadField);
+        southLeft.add(sendBtn);
         southLeft.add(dumpBtn);
         southLeft.add(cancelBtn);
         southLeft.add(new JLabel("  View:"));
@@ -579,6 +666,29 @@ public final class Main {
                 cancelBtn.setEnabled(false);
                 progress.setText(progress.getText() + " — cancelling…");
             }
+        });
+
+        sendBtn.addActionListener(e -> {
+            String mnemonic = commandField.getText();
+            if (mnemonic.length() != 2) {
+                return;
+            }
+            String payloadText = payloadField.getText();
+            PK232Client client = clientRef.get();
+            if (client == null || !client.isRunning()) {
+                return;
+            }
+            new Thread(() -> {
+                try {
+                    sendHostCommand(client, mnemonic, payloadText, output);
+                } catch (IOException ignored) {
+                    // no extra UI/logging beyond PK232Client / SerialLink
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                } finally {
+                    SwingUtilities.invokeLater(() -> payloadField.setText(""));
+                }
+            }, "MemoryInspector-sendHost").start();
         });
 
         frame.addWindowListener(new WindowAdapter() {
