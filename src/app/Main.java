@@ -4,6 +4,7 @@ import config.AppSettings;
 import dump.DumpController;
 import dump.DumpController.Outcome;
 import dump.DumpController.ViewMode;
+import protocol.HostCodec;
 import protocol.HostBlock;
 import protocol.HostModeEntry;
 import protocol.HostModeEntry.HostModeEntryException;
@@ -57,12 +58,18 @@ import java.io.IOException;
 import java.io.PrintWriter;
 import java.lang.reflect.InvocationTargetException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Locale;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * Application entry point. Boot state machine:
@@ -92,8 +99,15 @@ public final class Main {
 
     private static final int MAX_CONNECT_FAILURES = 3;
 
+    /** Matches lines {@code $XXXX: HH HH HH ...} from saved hex dumps / upload listings. */
+    private static final Pattern UPLOAD_DUMP_LINE_PATTERN = Pattern.compile(
+            "^\\$([0-9A-Fa-f]{4}):\\s+([0-9A-Fa-f]{2}(\\s+[0-9A-Fa-f]{2})*)$");
+
     /** Displayed by Help → About (§8 Change Log 2026-04-21 "M6 scope locked"). */
     static final String APP_VERSION = "Beta Release";
+
+    /** Correlated host-command reply wait for upload path (does not alter dump / Send timeout). */
+    private static final long UPLOAD_REPLY_TIMEOUT_MS = 100L;
 
     /**
      * Gate for the Settings → Port… reconnect worker — prevents a second
@@ -494,18 +508,11 @@ public final class Main {
     }
 
     /**
-     * Sends a PK-232 host global command: {@code SOH 0x4F} + 2-letter ASCII
-     * mnemonic + optional UTF-8 payload + {@code ETB}, using
-     * {@link HostCodec} framing via {@link PK232Client#sendAndAwait}, then
-     * appends the decoded response block to {@code output} on the EDT.
+     * Builds a {@code CTL_GLOBAL_COMMAND} {@link HostBlock} with a 2-letter
+     * ASCII mnemonic and optional UTF-8 payload suffix (same shape as Send /
+     * {@link PK232Client#sendAndAwait}).
      */
-    private static void sendHostCommand(PK232Client client,
-                                        String mnemonic,
-                                        String payload,
-                                        JTextArea output)
-            throws IOException, InterruptedException {
-        Objects.requireNonNull(client, "client");
-        Objects.requireNonNull(output, "output");
+    private static HostBlock buildGlobalAsciiHostBlock(String mnemonic, String payload) {
         Objects.requireNonNull(mnemonic, "mnemonic");
         if (mnemonic.length() != 2) {
             throw new IllegalArgumentException("mnemonic must be exactly 2 characters");
@@ -529,11 +536,199 @@ public final class Main {
             blockPayload[1] = (byte) mnemonic.charAt(1);
             System.arraycopy(utf8, 0, blockPayload, 2, utf8.length);
         }
-        HostBlock request = new HostBlock(HostBlock.CTL_GLOBAL_COMMAND, blockPayload);
+        return new HostBlock(HostBlock.CTL_GLOBAL_COMMAND, blockPayload);
+    }
+
+    /**
+     * Sends a PK-232 host global command: {@code SOH 0x4F} + 2-letter ASCII
+     * mnemonic + optional UTF-8 payload + {@code ETB}, using
+     * {@link HostCodec} framing via {@link PK232Client#sendAndAwait}, then
+     * appends the decoded response block to {@code output} on the EDT.
+     */
+    private static void sendHostCommand(PK232Client client,
+                                        String mnemonic,
+                                        String payload,
+                                        JTextArea output)
+            throws IOException, InterruptedException {
+        Objects.requireNonNull(client, "client");
+        Objects.requireNonNull(output, "output");
+        HostBlock request = buildGlobalAsciiHostBlock(mnemonic, payload);
         HostBlock response = client.sendAndAwait(request, PK232Client.DEFAULT_TIMEOUT_MS);
 
         final String rxLine = formatHostBlockResponseLine(response);
         SwingUtilities.invokeLater(() -> output.append("> " + rxLine + "\n"));
+    }
+
+    /**
+     * Upload path: show outgoing framed packet as space-separated uppercase hex
+     * (same style as {@link HexUtils#bytesToSpacedHex}), send, then wait up to
+     * {@link #UPLOAD_REPLY_TIMEOUT_MS} for a correlated response; on timeout
+     * continue without throwing.
+     */
+    private static void sendHostCommandUpload(PK232Client client,
+                                              String mnemonic,
+                                              String payload,
+                                              JTextArea output)
+            throws IOException, InterruptedException {
+        Objects.requireNonNull(client, "client");
+        Objects.requireNonNull(output, "output");
+        HostBlock request = buildGlobalAsciiHostBlock(mnemonic, payload);
+        byte[] framed = HostCodec.encode(request.ctl(), request.payloadCopy());
+        SwingUtilities.invokeLater(() -> output.append(
+                "< " + HexUtils.bytesToSpacedHex(framed, 0, framed.length) + "\n"));
+        HostBlock response = client.sendAndAwaitOrNull(request, UPLOAD_REPLY_TIMEOUT_MS);
+        if (response != null) {
+            final String rxLine = formatHostBlockResponseLine(response);
+            SwingUtilities.invokeLater(() -> output.append("> " + rxLine + "\n"));
+        } else {
+            SwingUtilities.invokeLater(() -> output.append(
+                    "> [Timeout after " + UPLOAD_REPLY_TIMEOUT_MS + " ms]\n"));
+        }
+    }
+
+    private static void startUpload(JFrame parent,
+                                    AtomicReference<PK232Client> clientRef,
+                                    JTextArea output) {
+        JFileChooser chooser = new JFileChooser();
+        if (chooser.showOpenDialog(parent) != JFileChooser.APPROVE_OPTION) {
+            return;
+        }
+        File f = chooser.getSelectedFile();
+        if (f == null) {
+            return;
+        }
+        try {
+            List<String> lines = Files.readAllLines(f.toPath(), StandardCharsets.UTF_8);
+            parseUploadFile(parent, clientRef, output, lines);
+        } catch (IOException ex) {
+            JOptionPane.showMessageDialog(parent,
+                    "Failed to read file:\n" + ex.getMessage(),
+                    "Memory Inspector — Upload",
+                    JOptionPane.ERROR_MESSAGE);
+        }
+    }
+
+    private static void parseUploadFile(JFrame parent,
+                                        AtomicReference<PK232Client> clientRef,
+                                        JTextArea output,
+                                        List<String> lines) {
+        List<Integer> regionAddresses = new ArrayList<>();
+        List<List<String>> regionBytes = new ArrayList<>();
+
+        for (String line : lines) {
+            Matcher m = UPLOAD_DUMP_LINE_PATTERN.matcher(line);
+            if (!m.matches()) {
+                continue;
+            }
+            int addr = Integer.parseInt(m.group(1), 16);
+            regionAddresses.add(addr);
+
+            List<String> pairsForLine = new ArrayList<>();
+            String bytesPart = m.group(2);
+            for (String pair : bytesPart.trim().split("\\s+")) {
+                if (!pair.isEmpty()) {
+                    pairsForLine.add(pair.toUpperCase(Locale.ROOT));
+                }
+            }
+            regionBytes.add(pairsForLine);
+        }
+
+        if (regionAddresses.isEmpty()) {
+            return;
+        }
+
+        int regionCount = regionAddresses.size();
+        int totalBytes = 0;
+        for (List<String> rb : regionBytes) {
+            totalBytes += rb.size();
+        }
+
+        showUploadConfirmation(parent, clientRef, output,
+                regionAddresses, regionBytes, totalBytes, regionCount);
+    }
+
+    /**
+     * @param regionAddresses parsed base address per valid upload line (one region per line)
+     * @param regionBytes hex pairs ({@code HH}) per line, uppercase, parallel to addresses
+     * @param totalBytes sum of lengths of inner byte lists
+     * @param regionCount {@code regionAddresses.size()}
+     */
+    private static void showUploadConfirmation(JFrame parent,
+                                               AtomicReference<PK232Client> clientRef,
+                                               JTextArea output,
+                                               List<Integer> regionAddresses,
+                                               List<List<String>> regionBytes,
+                                               int totalBytes,
+                                               int regionCount) {
+        int startAddr = regionAddresses.get(0);
+        int lastRegion = regionCount - 1;
+        int endAddr = regionAddresses.get(lastRegion)
+                + regionBytes.get(lastRegion).size() - 1;
+        String message = String.format(
+                "Regions:        %d%n"
+                        + "Start Address:  $%04X%n"
+                        + "End Address:    $%04X%n"
+                        + "Total Bytes:    %d",
+                regionCount,
+                startAddr,
+                endAddr,
+                totalBytes);
+        int choice = JOptionPane.showConfirmDialog(
+                parent,
+                message,
+                "Confirm Upload",
+                JOptionPane.OK_CANCEL_OPTION);
+        if (choice != JOptionPane.OK_OPTION) {
+            return;
+        }
+        runUpload(parent, clientRef, output, regionAddresses, regionBytes);
+    }
+
+    /**
+     * Multi-region firmware upload driven by paired address / byte-list rows.
+     * {@code PK232Client} and {@code output} come from {@link #parseUploadFile}
+     * so {@link #sendHostCommand} can operate on the modal’s stream.
+     */
+    private static void runUpload(JFrame parent,
+                                  AtomicReference<PK232Client> clientRef,
+                                  JTextArea output,
+                                  List<Integer> regionAddresses,
+                                  List<List<String>> regionBytes) {
+        new Thread(() -> {
+            PK232Client client = clientRef.get();
+            if (client == null || !client.isRunning()) {
+                SwingUtilities.invokeLater(() -> JOptionPane.showMessageDialog(parent,
+                        "PK232Client is not running; cannot upload.",
+                        "Memory Inspector — Upload",
+                        JOptionPane.ERROR_MESSAGE));
+                return;
+            }
+            int totalBytes = 0;
+            for (List<String> rb : regionBytes) {
+                totalBytes += rb.size();
+            }
+            int bytesSent = 0;
+            try {
+                for (int i = 0; i < regionAddresses.size(); i++) {
+                    String aePayload = "$" + String.format("%04X", regionAddresses.get(i));
+                    sendHostCommand(client, "AE", aePayload, output);
+                    for (String hh : regionBytes.get(i)) {
+                        String payload = "$" + hh.toUpperCase(Locale.ROOT);
+                        sendHostCommand(client, "MM", payload, output);
+                        bytesSent++;
+                        final int bs = bytesSent;
+                        final int nt = totalBytes;
+                        SwingUtilities.invokeLater(() -> output.append(
+                                "> Uploading... " + bs + "/" + nt + " bytes\n"));
+                    }
+                }
+                SwingUtilities.invokeLater(() -> output.append("> Upload complete\n"));
+            } catch (IOException ignored) {
+                // no extra UI/logging beyond PK232Client / SerialLink
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+            }
+        }, "MemoryInspector-upload").start();
     }
 
     private static void showPlaceholderMainWindow(SerialLink link,
@@ -592,6 +787,7 @@ public final class Main {
 
         JLabel commandLabel = new JLabel("Command:", SwingConstants.LEFT);
         JLabel payloadLabel = new JLabel("payload", SwingConstants.LEFT);
+        JButton uploadBtn = new JButton("Upload...");
         JButton  sendBtn     = new JButton("Send");
 
         JPanel southLeft = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 6));
@@ -599,6 +795,7 @@ public final class Main {
         southLeft.add(commandField);
         southLeft.add(payloadLabel);
         southLeft.add(payloadField);
+        southLeft.add(uploadBtn);
         southLeft.add(sendBtn);
         southLeft.add(dumpBtn);
         southLeft.add(cancelBtn);
@@ -667,6 +864,8 @@ public final class Main {
                 progress.setText(progress.getText() + " — cancelling…");
             }
         });
+
+        uploadBtn.addActionListener(e -> startUpload(frame, clientRef, output));
 
         sendBtn.addActionListener(e -> {
             String mnemonic = commandField.getText();

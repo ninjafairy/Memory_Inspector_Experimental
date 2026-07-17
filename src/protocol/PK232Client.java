@@ -214,6 +214,46 @@ public final class PK232Client implements AutoCloseable {
     }
 
     /**
+     * Same wire behavior as {@link #sendAndAwait(HostBlock, long)}, but if no
+     * correlated {@code 0x4F} reply arrives within {@code timeoutMs} this
+     * returns {@code null} instead of throwing {@link ProtocolTimeoutException}.
+     * Late responses become {@linkplain #unsolicitedHandler unsolicited}.
+     *
+     * @return the correlated response block, or {@code null} on timeout only
+     */
+    public HostBlock sendAndAwaitOrNull(HostBlock request, long timeoutMs)
+            throws IOException, InterruptedException {
+        Objects.requireNonNull(request, "request");
+        if (timeoutMs <= 0) {
+            throw new IllegalArgumentException("timeoutMs must be > 0: " + timeoutMs);
+        }
+        if (!isRunning()) {
+            throw new IOException("PK232Client is not running");
+        }
+        IOException priorReaderFailure = readerError;
+        if (priorReaderFailure != null) {
+            throw new IOException("reader thread failed earlier: "
+                    + priorReaderFailure.getMessage(), priorReaderFailure);
+        }
+
+        String mnem = deriveMnemonic(request, "CMD");
+        sendLock.lockInterruptibly();
+        try {
+            PendingRequest p = new PendingRequest(1);
+            pending = p;
+            byte[] framed = HostCodec.encode(request.ctl(), request.payloadCopy());
+            log.log(PacketLogger.Direction.TX, mnem, framed, 0, framed.length);
+            link.write(framed);
+
+            HostBlock response = p.awaitOne(timeoutMs);
+            return response;
+        } finally {
+            pending = null;
+            sendLock.unlock();
+        }
+    }
+
+    /**
      * Set the modem's ADDRESS register via the {@code AE <decimal>} host
      * command (truenorth A2 + A6). {@code addr} must fit in 16 bits. The
      * caller is expected to have already parsed the 4-hex UI value via
